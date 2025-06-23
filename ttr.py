@@ -10,41 +10,7 @@ import itertools
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import pygame
-
-# Constants for action definitions
-ACTION_DRAW_TRAIN_CARDS = 0
-ACTION_DRAW_TICKETS = 1
-ACTION_CLAIM_ROUTE = 2
-
-# Constants for phases
-PHASE_INITIAL_TICKET_SELECTION = 0
-PHASE_MAIN = 1
-PHASE_DRAW_TRAIN_CARDS = 2
-PHASE_CHOOSE_TICKETS = 3
-PHASE_CLAIM_ROUTE = 4
-PHASE_CHOOSE_PAYMENT = 5
-
-# Routes array indices
-COST_ID_INDEX = 2
-CLAIMED_BY_INDEX = 3
-DRAW_BONUS_INDEX = 5
-LENGTH_INDEX = 6
-COLOR_INDEX = 7
-GAY_CARDS_INDEX = 8
-PAYMENT_IDS_INDEX = 9
-
-# Player tickets indices
-TICKET_OWNED = 0
-TICKET_COMPLETED = 1
-
-# Trajectory indices
-STATE_TENSOR_INDEX = 0
-REWARD_INDEX = 1
-VALUE_INDEX = 2
-LOG_ACTION_PROBS_INDEX = 3
-ACTION_INDEX = 4
-PHASE_INDEX = 5
-ACTION_MASK_INDEX = 6
+from constants import *
 
 # %%
 
@@ -143,14 +109,14 @@ class TicketToRideNorthernLightsEnv(gym.Env):
         if self._phase == PHASE_INITIAL_TICKET_SELECTION:
             # Must first select at least two tickets from intial four
             chosen_tickets, reward = self._choose_tickets(action, initial=True)
-            self._player_tickets[self._current_player, chosen_tickets] = 1
+            self._player_tickets[self._current_player, chosen_tickets, TICKET_OWNED] = 1
             self._initial_ticket_selection_done[self._current_player] = 1
 
             if np.all(self._initial_ticket_selection_done == 1):
                 # Everyone completed first action, move on to main phase
-                terminate = self._end_turn()
+                terminate, penalty = self._end_turn()
 
-                return self._get_obs(), 0, terminate, False, {}
+                return self._get_obs(), penalty, terminate, False, {}
             else:
                 # Stay in this phase
                 self._current_player = (self._current_player + 1) % self.n_players
@@ -191,15 +157,15 @@ class TicketToRideNorthernLightsEnv(gym.Env):
 
             if self._n_cards_drawn == 2:
                 # Max. no. cards to draw hit, return to the main phase
-                terminate = self._end_turn()
+                terminate, penalty = self._end_turn()
 
-                return self._get_obs(), 0, terminate, False, {}
+                return self._get_obs(), penalty, terminate, False, {}
             
             elif (self._card_id_to_color[card] == "gay") and action != 5:
                 # Face-up gay card drawn, return to the main phase
-                terminate = self._end_turn()
+                terminate, penalty = self._end_turn()
 
-                return self._get_obs(), 0, terminate, False, {}
+                return self._get_obs(), penalty, terminate, False, {}
             
             else:
                 # May keep drawing
@@ -208,14 +174,14 @@ class TicketToRideNorthernLightsEnv(gym.Env):
         elif self._phase == PHASE_CHOOSE_TICKETS:
             # Choose tickets and add to hand
             chosen_tickets, reward = self._choose_tickets(action)
-            self._player_tickets[self._current_player, chosen_tickets] = 1
+            self._player_tickets[self._current_player, chosen_tickets, TICKET_OWNED] = 1
 
             assert not np.any(self._player_tickets > 1), "Tickets have been selected multiple times"
 
             self._pending_tickets[self._current_player] = -1
-            terminate = self._end_turn()
+            terminate, penalty = self._end_turn()
 
-            return self._get_obs(), reward, terminate, False, {}
+            return self._get_obs(), (reward + penalty) / 10, terminate, False, {}
         
         elif self._phase == PHASE_CLAIM_ROUTE:
             assert 0 <= action < len(self._routes), "Improper route claiming action"
@@ -227,15 +193,15 @@ class TicketToRideNorthernLightsEnv(gym.Env):
             self._phase = PHASE_CHOOSE_PAYMENT
             self.action_space = self._choose_payment_action_space
 
-            return self._get_obs(), reward, False, False, {}
+            return self._get_obs(), reward / 10, False, False, {}
         
         elif self._phase == PHASE_CHOOSE_PAYMENT:
             assert np.all((self._player_hands[self._current_player] - self._route_cost_payments[action]) >= 0), "Can't afford payment"
 
             self._pay_for_route(action)
-            terminate = self._end_turn()
+            terminate, penalty = self._end_turn()
 
-            return self._get_obs(), 0, terminate, False, {}
+            return self._get_obs(), penalty / 10, terminate, False, {}
         
         else:
             raise RuntimeError(f"Unknown phase {self._phase}")
@@ -256,10 +222,11 @@ class TicketToRideNorthernLightsEnv(gym.Env):
         self._turns_remaining = 0
         self._train_card_deck = TrainCardDeck(self.np_random)
 
+        self._player_hands[:, :] = 0
         self._train_cards = self._train_card_deck.draw(5)
-        self._remaining_trains = self._remaining_trains = np.full((self.n_players,), self._n_starting_trains, dtype=int) # Remaining trains back to 40 for each player
+        self._remaining_trains[:] = self._n_starting_trains # Remaining trains back to 40 for each player
         self._routes[:, CLAIMED_BY_INDEX] = -1 # Set all routes to unclaimed
-        self._player_tickets = np.zeros((self.n_players, self._n_tickets, 2), dtype=int) # Reset player tickets
+        self._player_tickets[:, :, :] = 0 # Reset player tickets
         self._route_to_claim = np.array([], dtype=int)
 
         # Randomly draw 4 train cards and 4 tickets for each player
@@ -393,17 +360,29 @@ class TicketToRideNorthernLightsEnv(gym.Env):
 
 
     def _end_turn(self):
+        # Go back to main phase
         self._phase = PHASE_MAIN
         self.action_space = self._main_action_space
         self._current_player = (self._current_player + 1) % self.n_players # Next player
 
+        # Final round conditions
+        penalty = 0 # Used for negative rewards upon incomplete tickets at final turn
         if self._final_round:
+            penalty -= self._compute_incomplete_ticket_penalty(self._current_player)
             self._turns_remaining -= 1
+
             if self._turns_remaining == 0:
-                return True
+                return True, penalty
             
-        return False
+        return False, penalty
     
+
+    def _compute_incomplete_ticket_penalty(self, player_id):
+        incompleted_owned_ticket_ids = np.where((self._player_tickets[player_id, :, TICKET_OWNED] == 1) & (self._player_tickets[player_id, :, TICKET_COMPLETED] == 0))[0]
+        penalty = np.sum(self._tickets[incompleted_owned_ticket_ids, 2])
+        
+        return penalty
+
 
     # Action legality functions
     def _get_action_mask(self):
@@ -431,11 +410,6 @@ class TicketToRideNorthernLightsEnv(gym.Env):
                     # If a route can be claimed, there exists a valid action, break out of the loop
                     action_mask[ACTION_CLAIM_ROUTE] = 1
                     break 
-
-            # TODO: remove after debugging
-            if np.all(action_mask == 0):
-                print("ALL ACTIONS UNAVAILABLE")
-                print(self._get_obs())
             
         elif self._phase == PHASE_DRAW_TRAIN_CARDS:
             # Can draw cards that aren't set to -1 (in case of empty deck/discard pile)
@@ -527,11 +501,13 @@ class TrainCardDeck:
             self.reshuffle()
 
         # Compute drawing probs based on deck and draw n cards
-        probs = self.deck_counts / self.deck_counts.sum()
-        draws = self.rng.choice(self.n_types, size=n, p=probs)
+        draws = []
+        for _ in range(n):
+            probs = self.deck_counts / self.deck_counts.sum()
+            draws.append(self.rng.choice(self.n_types, size=1, p=probs))
+            self.deck_counts[draws[-1]] -= 1
 
-        for card in draws:
-            self.deck_counts[card] -= 1
+        draws = np.concat(draws)
 
         return draws
     
@@ -551,9 +527,12 @@ class TrainCardDeck:
 import torch
 from torch import nn
 import torch.nn.functional as F
+from vis_classes import PPOTrainingMonitor
+import time
+
 
 class TicketToRideNorthernLightsPPOAgent:
-    def __init__(self, env: gym.Env, hidden_dim: int):
+    def __init__(self, env: gym.Env, policy_lr: float = 3e-4, value_lr: float = 1e-4):
         super().__init__()
 
         self.env = env
@@ -570,12 +549,12 @@ class TicketToRideNorthernLightsPPOAgent:
 
         # Define the network heads based on action spaces and phases
         self.policy_heads = nn.ModuleDict()
-        self.policy_heads[str(PHASE_INITIAL_TICKET_SELECTION)] = nn.Linear(hidden_dim, env._choose_initial_tickets_action_space.n)
-        self.policy_heads[str(PHASE_MAIN)] = nn.Linear(hidden_dim, env._main_action_space.n)
-        self.policy_heads[str(PHASE_DRAW_TRAIN_CARDS)] = nn.Linear(hidden_dim, env._draw_train_action_space.n)
-        self.policy_heads[str(PHASE_CHOOSE_TICKETS)] = nn.Linear(hidden_dim, env._choose_ticket_action_space.n)
-        self.policy_heads[str(PHASE_CLAIM_ROUTE)] = nn.Linear(hidden_dim, env._claim_route_action_space.n)
-        self.policy_heads[str(PHASE_CHOOSE_PAYMENT)] = nn.Linear(hidden_dim, env._choose_payment_action_space.n)
+        self.policy_heads[str(PHASE_INITIAL_TICKET_SELECTION)] = nn.Linear(128, env._choose_initial_tickets_action_space.n)
+        self.policy_heads[str(PHASE_MAIN)] = nn.Linear(128, env._main_action_space.n)
+        self.policy_heads[str(PHASE_DRAW_TRAIN_CARDS)] = nn.Linear(128, env._draw_train_action_space.n)
+        self.policy_heads[str(PHASE_CHOOSE_TICKETS)] = nn.Linear(128, env._choose_ticket_action_space.n)
+        self.policy_heads[str(PHASE_CLAIM_ROUTE)] = nn.Linear(128, env._claim_route_action_space.n)
+        self.policy_heads[str(PHASE_CHOOSE_PAYMENT)] = nn.Linear(128, env._choose_payment_action_space.n)
 
         # Value network
         self.value_net = nn.Sequential(
@@ -589,8 +568,8 @@ class TicketToRideNorthernLightsPPOAgent:
         )
 
         # Initialize optimizers
-        self.policy_optimizer = torch.optim.Adam(list(self.policy_encoder.parameters()) + list(self.policy_heads.parameters()))
-        self.value_optimizer = torch.optim.Adam(list(self.value_net.parameters()))
+        self.policy_optimizer = torch.optim.Adam(list(self.policy_encoder.parameters()) + list(self.policy_heads.parameters()), lr=policy_lr)
+        self.value_optimizer = torch.optim.Adam(list(self.value_net.parameters()), lr=value_lr)
 
 
     def input_dim_from_env(self):
@@ -697,9 +676,11 @@ class TicketToRideNorthernLightsPPOAgent:
         return obs
 
         
-    def get_trajectory_batch(self, n: int = 3, gamma: float = 0.9):
+    def get_trajectory_batch(self, n: int = 3, gamma: float = 0.99, lambd: float = 0.95):
         trajectories = []
         advantages = []
+        returns = []
+        values = []
 
         for _ in range(n):
             obs, _ = self.env.reset()
@@ -721,40 +702,99 @@ class TicketToRideNorthernLightsPPOAgent:
                 episode_over = terminated or truncated
 
             rewards = torch.tensor([traj[REWARD_INDEX] for traj in trajectory])
-            values = torch.cat([traj[VALUE_INDEX] for traj in trajectory])
-            
-            advantages.append(self.compute_advantages(rewards, values, gamma))
+            values_ep = torch.cat([traj[VALUE_INDEX] for traj in trajectory])
+            returns_ep = self.compute_returns(rewards, gamma)
+
+            returns.append(returns_ep)
+            values.append(values_ep)
+
+            advantages_ep = self.compute_gae_advantages(rewards, values_ep, gamma, lambd=lambd)
+            advantages.append(advantages_ep)
+
             trajectories.append(trajectory)
 
-        advantages = torch.stack([adv for advantage in advantages for adv in advantage]) # Flatten advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8) # Normalize advantages
+        # Flatten and normalize advantages
+        advantages = torch.cat(advantages) 
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        return trajectories, advantages
+        return trajectories, advantages, returns, values
     
 
-    def train(self, n_iterations: int = 100, K: int = 20, n_sample : int = 20, epsilon: float = 0.25):
+    def compute_returns(self, rewards, gamma: float=0.9):
+        n = len(rewards)
+        returns = torch.zeros_like(rewards, dtype=torch.float32)
+
+        # Compute returns backwards
+        returns[-1] = rewards[-1]
+        for i in range(n - 2, -1, -1):
+            returns[i] = rewards[i] + gamma * returns[i + 1]
+
+        return returns
+    
+
+    def compute_gae_advantages(self, rewards, values, gamma: float=0.99, lambd: float = 0.95):
+        n = len(rewards)
+        advantages = torch.zeros_like(rewards, dtype=torch.float32)
+        gae = 0
+
+        # Add a zero at the end for loop below
+        values_with_next = torch.cat([values, torch.zeros(1)])
+
+        # Compute GAE backwards
+        for i in range(n - 1, -1, -1):
+            delta = rewards[i] + gamma * values_with_next[i + 1] - values_with_next[i]
+            gae = delta + gamma * lambd * gae
+            advantages[i] = gae
+
+        return advantages
+    
+
+    def train(self, n_iterations: int = 100, K: int = 20, n_sample : int = 20, gamma: float = 0.9, batch_size: int = 128, epsilon: float = 0.25, entropy_coef: float = 0.01):
         policy_losses = []
         value_losses = []
+        all_returns = []
+        all_values = []
+
         for _ in tqdm(range(n_iterations)):
-            trajectories, advantages = self.get_trajectory_batch(n=n_sample)
-            policy_losses_i, value_losses_i = self.optimize(trajectories, advantages, K=K, epsilon=epsilon)
+            trajectories, advantages, returns, values = self.get_trajectory_batch(n=n_sample, gamma=gamma)
+            policy_losses_i, value_losses_i = self.optimize(trajectories, advantages, returns, K=K, batch_size=batch_size, epsilon=epsilon, entropy_coef=entropy_coef)
             policy_losses += policy_losses_i
             value_losses += value_losses_i
 
-        fig, axs = plt.subplots(ncols=2)
+            all_returns = all_returns + [ret for retur in [retur.tolist() for retur in returns] for ret in retur]
+            all_values = all_values + [val for value in [value.tolist() for value in values] for val in value]
+
+        _, axs = plt.subplots(ncols=2)
         axs[0].plot(policy_losses)
         axs[1].plot(value_losses)
         axs[0].set(title="Policy Loss")
         axs[1].set(title="Value Loss")
 
+        print(f"Return stats:")
+        print(f"  Mean: {np.mean(all_returns):.4f}")
+        print(f"  Std: {np.std(all_returns):.4f}")
+        print(f"  Min: {np.min(all_returns):.4f}")
+        print(f"  Max: {np.max(all_returns):.4f}")
+        print(f"  Non-zero rewards: {np.sum(all_returns != 0)}/{len(all_returns)}")
+        
+        print(f"Value stats:")
+        print(f"  Mean: {np.mean(all_values):.4f}")
+        print(f"  Std: {np.std(all_values):.4f}")
+        print(f"  Min: {np.min(all_values):.4f}")
+        print(f"  Max: {np.max(all_values):.4f}")
+        
+        if np.std(all_values) < 0.01:
+            print("WARNING: Value function may have collapsed!")
 
-    def optimize(self, trajectories: list, advantages: list, K: int = 10, batch_size: int = 128, epsilon: float = 0.25):
+
+    def optimize(self, trajectories: list, advantages: list, returns: list, K: int = 10, batch_size: int = 128, epsilon: float = 0.25, entropy_coef: float = 0.01):
         states = torch.stack([traj[STATE_TENSOR_INDEX] for trajectory in trajectories for traj in trajectory])
-        old_values = torch.stack([traj[VALUE_INDEX] for trajectory in trajectories for traj in trajectory])
         old_log_probs = torch.cat([traj[LOG_ACTION_PROBS_INDEX] for trajectory in trajectories for traj in trajectory])
         actions = torch.cat([traj[ACTION_INDEX] for trajectory in trajectories for traj in trajectory])
         phases = [traj[PHASE_INDEX] for trajectory in trajectories for traj in trajectory]
         action_masks = [traj[ACTION_MASK_INDEX] for trajectory in trajectories for traj in trajectory]
+
+        value_targets = torch.cat(returns)
 
         # Iterate through epochs
         policy_losses = []
@@ -765,7 +805,7 @@ class TicketToRideNorthernLightsPPOAgent:
             # Iterate over minibatches
             for i in range(0, states.size()[0], batch_size):
                 # Get minibatch
-                indices = permutation[i:i+batch_size]
+                indices = permutation[i:i + batch_size]
                 state_batch = states[indices]
 
                 # Pass data through models
@@ -776,8 +816,8 @@ class TicketToRideNorthernLightsPPOAgent:
                 new_log_probs = torch.log(torch.stack([action_probs[j][actions_batch[j]] for j in range(len(action_probs))]))
 
                 # Reset optimizer gradients
-                policy_loss = self.ppo_loss(new_log_probs, old_log_probs[indices], advantages[indices], epsilon)
-                value_loss = F.mse_loss(values, old_values[indices])
+                policy_loss = self.ppo_loss(new_log_probs, old_log_probs[indices], action_probs, advantages[indices], epsilon, entropy_coef)
+                value_loss = F.mse_loss(values, value_targets[indices].unsqueeze(-1))
 
                 self.policy_optimizer.zero_grad()
                 policy_loss.backward()
@@ -791,33 +831,19 @@ class TicketToRideNorthernLightsPPOAgent:
                 value_losses.append(value_loss.item())
 
         return policy_losses, value_losses
-
-
-    def compute_advantages(self, rewards, values, gamma: float = 0.9):
-        assert len(rewards) == len(values), "Dimensionality mismatch between rewards and values"
-        
-        n = len(rewards)
-        Q_values = []
-
-        # Compute Q value for each action taken
-        for i in range(n):
-            discount_factors = gamma ** torch.arange(n - i)
-            Q_values.append(torch.sum(rewards[i:] * discount_factors))
-
-        # Compute A_t = Q - V
-        Q_values = torch.stack(Q_values)
-        advantages = Q_values - values
-
-        return advantages
         
 
-    def ppo_loss(self, new_log_probs, old_log_probs, advantages, epsilon: float = 0.2):
+    def ppo_loss(self, new_log_probs, old_log_probs, action_probs, advantages, epsilon: float = 0.2, entropy_coef: float = 0.01):
         assert len(new_log_probs) == len(old_log_probs), "Dimensionality mismatch between old and new probabilities"
 
         r = torch.exp(new_log_probs - old_log_probs) # Compute probability ratios
         surr1 = r * advantages  # First part or minimum
         surr2 = torch.clamp(r, 1 - epsilon, 1 + epsilon) * advantages # Second part, clip the ratio
         loss = -torch.min(surr1, surr2).mean() # Take the mean of the minimum between the two, negative to minimize
+
+        # Add entropy bonus for exploration
+        entropy = torch.stack([-(action_prob * torch.log(action_prob + 1e-8)).sum() for action_prob in action_probs]).mean()
+        loss -= entropy_coef * entropy
 
         return loss
     
@@ -833,22 +859,22 @@ class TicketToRideNorthernLightsPPOAgent:
 
 import pickle
 
-env = TicketToRideNorthernLightsEnv()
-agent = TicketToRideNorthernLightsPPOAgent(env, hidden_dim=128)
-# agent.train(n_iterations=100, K=20)
+# env = TicketToRideNorthernLightsEnv()
+# agent = TicketToRideNorthernLightsPPOAgent(env, policy_lr=3e-4, value_lr=3e-4)
+# agent.train(n_iterations=10, K=4, n_sample=20, gamma=0.99, batch_size=256, entropy_coef=0.1)
 
-# with open("trained_agent.pkl", "wb") as f:
+# with open("trained_agent_small.pkl", "wb") as f:
 #     pickle.dump(agent, f)
 
-# with open("trained_agent.pkl", "rb") as f:
-#     agent = pickle.load(f)
+with open("trained_agent_small.pkl", "rb") as f:
+    agent = pickle.load(f)
 
-trajectories, advantages = agent.get_trajectory_batch(n=1)
+trajectories, advantages, rewards, values = agent.get_trajectory_batch(n=1)
 trajectory = trajectories[0]
 
 # %%
-from vis_constants import cities, routes, player_colors
-from vis_classes import TrainCardMarket, PlayerHand, ActionTracker, draw_dashed_line
+from vis_constants import *
+from vis_classes import *
 import pygame
 import sys
 
@@ -862,50 +888,81 @@ screen.fill("white")
 pygame.display.set_caption("Ticket to Ride: Northern Lights")
 clock = pygame.time.Clock()
 
-# Initialize train cards
-card_dim_w = (50, 35)
-card_dim_h = (35, 50)
-train_cards = [pygame.Surface(card_dim_h) for _ in range(6)]
-[train_card.fill("green") for train_card in train_cards[:5]]
-train_cards[-1].fill("gray")
-
 # Initialize board
 board_image = pygame.image.load("ticket-to-ride-northern-lights.jpg")
 board_image = pygame.transform.scale_by(board_image, 1.2)
 board_width, board_height = board_image.get_size()
 board_loc = ((width - board_width) / 2, (height - board_height) / 2)
 
-[screen.blit(train_card, (width / 2 - 3 * card_dim_h[0] + i * card_dim_h[0], (height - board_height) / 2 - card_dim_h[1])) for i, train_card in enumerate(train_cards)]
-screen.blit(board_image, board_loc)
-
 board_outline_out = pygame.Surface((board_width, board_height))
 board_outline_out.fill("black")
 board_outline_in = pygame.Surface((board_width - 10, board_height - 10))
 board_outline_in.fill("white")
 
-screen.blit(board_outline_out, board_loc)
-screen.blit(board_outline_in, (board_loc[0] + 5, board_loc[1] + 5))
-
 # Define gameplay objects
 train_card_market = TrainCardMarket((width, height), board_height)
 player_hands = [PlayerHand((width, height), (board_width, board_height), i) for i in range(agent.env.n_players)]
 action_tracker = ActionTracker((500, 30))
+score_board = ScoreBoard(agent.env.n_players, (10, 10))
 
-# Draw board graph
-# for route in routes:
-#     pygame.draw.line(screen, colors[route[3]], cities[route[0]][0], cities[route[1]][0], width=3)
 
-[pygame.draw.circle(screen, "black", city_loc, 5) for city_loc, _ in cities]
+
+
 
 # Gameplay loop
 step_index = 0
 is_paused = False
+auto_play = True
+auto_speed = 1
 
 while True:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
-            pygame.quit()
-            sys.exit()
+            running = False
+            
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_SPACE:
+                # Toggle auto-play
+                auto_play = not auto_play
+                is_paused = not auto_play
+                
+            elif event.key == pygame.K_LEFT:
+                # Step backward
+                if step_index > 0:
+                    step_index -= 1
+                auto_play = False
+                is_paused = True
+                
+            elif event.key == pygame.K_RIGHT:
+                # Step forward
+                if step_index < len(trajectory) - 1:
+                    step_index += 1
+                auto_play = False
+                is_paused = True
+                
+            elif event.key == pygame.K_UP:
+                # Increase auto-play speed
+                auto_speed = min(auto_speed + 1, 10)
+                
+            elif event.key == pygame.K_DOWN:
+                # Decrease auto-play speed
+                auto_speed = max(auto_speed - 1, 1)
+                
+            elif event.key == pygame.K_HOME:
+                # Go to beginning
+                step_index = 0
+                auto_play = False
+                is_paused = True
+                
+            elif event.key == pygame.K_END:
+                # Go to end
+                step_index = len(trajectory) - 1
+                auto_play = False
+                is_paused = True
+                
+            elif event.key == pygame.K_ESCAPE:
+                # Quit
+                running = False
 
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_SPACE:
@@ -937,18 +994,24 @@ while True:
         for ticket in player_tickets:
             draw_dashed_line(screen, player_colors[obs["current_player"]], cities[ticket[2]][0], cities[ticket[3]][0], width=1)
 
+        # Update score board
+        score_board.update(obs["current_player"], int(traj[REWARD_INDEX] * 10))
+        score_board.draw(screen)
+
         step_index += 1
 
-        # pygame.image.save(screen, f"frame_{step_index}.png")
-
     pygame.display.update()
-    clock.tick(1)
 
-    if step_index == (len(trajectory) - 1):
-        pygame.quit()
-        break
+    # Control frame rate
+    if auto_play:
+        clock.tick(auto_speed)
+    else:
+        clock.tick(60)
+
+    # if step_index == (len(trajectory) - 1):
+    #     pygame.quit()
+    #     break
         
 
 # %%
-
 

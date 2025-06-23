@@ -2,6 +2,12 @@ import pygame
 import numpy as np
 from vis_constants import colors, font, player_colors
 import math
+import torch
+import matplotlib.pyplot as plt
+from collections import defaultdict, deque
+import time
+import json
+from pathlib import Path
 
 
 class TrainCardMarket:
@@ -122,6 +128,31 @@ class ActionTracker:
         screen.blit(self.current_player_text, (self.loc[0], self.loc[1] + 2 * font.get_height()))
 
 
+class ScoreBoard:
+    def __init__(self, n_players, loc):
+        self.n_players = n_players
+        self.loc = loc
+        self.player_scores = [0] * self.n_players
+        self.cover_width = 0
+
+    
+    def update(self, current_player, turn_reward):
+        self.player_scores[current_player] += turn_reward
+
+
+    def draw(self, screen):
+        # First draw white surface to cover previous text
+        white_surface = pygame.Surface((self.cover_width, font.get_height() * self.n_players))
+        white_surface.fill("white")
+        screen.blit(white_surface, self.loc)
+
+        # Then draw text
+        player_texts = [font.render(f"Player {i} score: {score}", False, "black") for i, score in enumerate(self.player_scores)]
+        [screen.blit(player_text, (self.loc[0], self.loc[1] + i * font.get_height())) for i, player_text in enumerate(player_texts)]
+
+        self.cover_width = max([player_text.get_width() for player_text in player_texts])
+
+
 class Point:
     def __init__(self, point_t = (0,0)):
         # Constructed using a normal tupple
@@ -148,16 +179,3 @@ class Point:
     # Get back values in original tuple format
     def get(self):
         return (self.x, self.y)
-
-
-def draw_dashed_line(surf, color, start_pos, end_pos, width=1, dash_length=10):
-    origin = Point(start_pos)
-    target = Point(end_pos)
-    displacement = target - origin
-    length = len(displacement)
-    slope = displacement/length
-
-    for index in range(0, math.ceil(length/dash_length), 2):
-        start = origin + (slope *    index    * dash_length)
-        end   = origin + (slope * (index + 1) * dash_length)
-        pygame.draw.line(surf, color, start.get(), end.get(), width)
