@@ -116,7 +116,7 @@ class TicketToRideNorthernLightsEnv(gym.Env):
                 # Everyone completed first action, move on to main phase
                 terminate, penalty = self._end_turn()
 
-                return self._get_obs(), penalty, terminate, False, {}
+                return self._get_obs(), penalty / 10, terminate, False, {}
             else:
                 # Stay in this phase
                 self._current_player = (self._current_player + 1) % self.n_players
@@ -159,14 +159,18 @@ class TicketToRideNorthernLightsEnv(gym.Env):
                 # Max. no. cards to draw hit, return to the main phase
                 terminate, penalty = self._end_turn()
 
-                return self._get_obs(), penalty, terminate, False, {}
+                return self._get_obs(), penalty / 10, terminate, False, {}
             
             elif (self._card_id_to_color[card] == "gay") and action != 5:
                 # Face-up gay card drawn, return to the main phase
                 terminate, penalty = self._end_turn()
 
-                return self._get_obs(), penalty, terminate, False, {}
-            
+                return self._get_obs(), penalty / 10, terminate, False, {}
+            elif np.all(self._train_cards == -1) and (self._train_card_deck.deck_counts.sum() == 0):
+                  # No more cards left to draw
+                  terminate, penalty = self._end_turn()
+                  
+                  return self._get_obs(), penalty, False, False, {}
             else:
                 # May keep drawing
                 return self._get_obs(), 0, False, False, {}
@@ -380,7 +384,7 @@ class TicketToRideNorthernLightsEnv(gym.Env):
     def _compute_incomplete_ticket_penalty(self, player_id):
         incompleted_owned_ticket_ids = np.where((self._player_tickets[player_id, :, TICKET_OWNED] == 1) & (self._player_tickets[player_id, :, TICKET_COMPLETED] == 0))[0]
         penalty = np.sum(self._tickets[incompleted_owned_ticket_ids, 2])
-        
+
         return penalty
 
 
@@ -503,6 +507,10 @@ class TrainCardDeck:
         # Compute drawing probs based on deck and draw n cards
         draws = []
         for _ in range(n):
+            if self.deck_counts.sum() == 0:
+                # No cards left
+                break
+
             probs = self.deck_counts / self.deck_counts.sum()
             draws.append(self.rng.choice(self.n_types, size=1, p=probs))
             self.deck_counts[draws[-1]] -= 1
@@ -527,8 +535,6 @@ class TrainCardDeck:
 import torch
 from torch import nn
 import torch.nn.functional as F
-from vis_classes import PPOTrainingMonitor
-import time
 
 
 class TicketToRideNorthernLightsPPOAgent:
@@ -859,22 +865,22 @@ class TicketToRideNorthernLightsPPOAgent:
 
 import pickle
 
-# env = TicketToRideNorthernLightsEnv()
-# agent = TicketToRideNorthernLightsPPOAgent(env, policy_lr=3e-4, value_lr=3e-4)
-# agent.train(n_iterations=10, K=4, n_sample=20, gamma=0.99, batch_size=256, entropy_coef=0.1)
+env = TicketToRideNorthernLightsEnv()
+agent = TicketToRideNorthernLightsPPOAgent(env, policy_lr=3e-4, value_lr=3e-4)
+agent.train(n_iterations=100, K=4, n_sample=64, gamma=0.99, batch_size=256, entropy_coef=0.1)
 
-# with open("trained_agent_small.pkl", "wb") as f:
-#     pickle.dump(agent, f)
+with open("trained_agent.pkl", "wb") as f:
+    pickle.dump(agent, f)
 
-with open("trained_agent_small.pkl", "rb") as f:
-    agent = pickle.load(f)
+# with open("trained_agent_small.pkl", "rb") as f:
+#     agent = pickle.load(f)
 
 trajectories, advantages, rewards, values = agent.get_trajectory_batch(n=1)
 trajectory = trajectories[0]
 
 # %%
-from vis_constants import *
 from vis_classes import *
+from vis_functions import *
 import pygame
 import sys
 
@@ -903,19 +909,18 @@ board_outline_in.fill("white")
 train_card_market = TrainCardMarket((width, height), board_height)
 player_hands = [PlayerHand((width, height), (board_width, board_height), i) for i in range(agent.env.n_players)]
 action_tracker = ActionTracker((500, 30))
-score_board = ScoreBoard(agent.env.n_players, (10, 10))
-
-
-
-
+score_board = ScoreBoard(agent.env.n_players, (10, 10), len(trajectory))
 
 # Gameplay loop
 step_index = 0
 is_paused = False
 auto_play = True
 auto_speed = 1
+running = True
 
-while True:
+draw_base_board(screen, board_image, board_loc, board_outline_out, board_outline_in)
+
+while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
@@ -954,12 +959,6 @@ while True:
                 auto_play = False
                 is_paused = True
                 
-            elif event.key == pygame.K_END:
-                # Go to end
-                step_index = len(trajectory) - 1
-                auto_play = False
-                is_paused = True
-                
             elif event.key == pygame.K_ESCAPE:
                 # Quit
                 running = False
@@ -968,37 +967,17 @@ while True:
             if event.key == pygame.K_SPACE:
                 is_paused = not is_paused
 
-    if not is_paused and step_index < len(trajectory):
-        traj = trajectory[step_index]
-        obs = agent.unprepare_state_tensor(traj[STATE_TENSOR_INDEX])
+    # Auto-play
+    if auto_play and not is_paused:
+        if step_index < len(trajectory) - 1:
+            # Only continue if not reached end
+            step_index += 1
+        else:
+            # Reached end, pause auto-play
+            auto_play = False
+            is_paused = True
 
-        action_tracker.update(traj[PHASE_INDEX], traj[ACTION_INDEX].item(), obs["current_player"])
-        action_tracker.draw(screen)
-
-        # Draw a claimed route
-        if traj[PHASE_INDEX] == PHASE_CLAIM_ROUTE:
-            route = routes[traj[ACTION_INDEX].item()]
-            pygame.draw.line(screen, player_colors[obs["current_player"]], cities[route[0]][0], cities[route[1]][0], width=3)
-            
-        # Update train cards
-        train_card_market.update([train_card for train_card in obs["train_cards"].tolist()])
-        train_card_market.draw(screen)
-
-        # Update player hands
-        player_hands[obs["current_player"]].update(obs["player_hand"])
-        [player_hand.draw(screen) for player_hand in player_hands]
-
-        # Draw owned tickets
-        player_tickets = obs["player_tickets"]
-        player_tickets = player_tickets[np.where(player_tickets[:, 0] == 1)] # Owned tickets
-        for ticket in player_tickets:
-            draw_dashed_line(screen, player_colors[obs["current_player"]], cities[ticket[2]][0], cities[ticket[3]][0], width=1)
-
-        # Update score board
-        score_board.update(obs["current_player"], int(traj[REWARD_INDEX] * 10))
-        score_board.draw(screen)
-
-        step_index += 1
+    render_frame(step_index, trajectory, agent, screen, action_tracker, train_card_market, player_hands, score_board, height, width, auto_play, auto_speed, board_image, board_loc, board_outline_out, board_outline_in)
 
     pygame.display.update()
 
@@ -1008,9 +987,8 @@ while True:
     else:
         clock.tick(60)
 
-    # if step_index == (len(trajectory) - 1):
-    #     pygame.quit()
-    #     break
+pygame.quit()
+sys.exit()
         
 
 # %%

@@ -32,18 +32,6 @@ def draw_frame_info(screen, trajectory, step_index, height, width, auto_play, au
     frame_text = font.render(f"Frame: {step_index + 1} / {len(trajectory)}", True, "black")
     screen.blit(frame_text, (10, height - 60))
 
-    controls = [
-        "← → : Step back/forward",
-        "SPACE: Play/Pause",
-        "↑ ↓ : Speed up/down",
-        "HOME: Go to start",
-        "END: Go to end",
-    ]
-
-    for i, control in enumerate(controls):
-        control_text = font.render(control, True, "black")
-        screen.blit(control_text, (10, height - 40 + i * 15))
-
     if auto_play:
         auto_text = font.render(f"AUTO (Speed: {auto_speed} fps)", True, "red")
         screen.blit(auto_text, (width - 150, height - 40))
@@ -52,12 +40,12 @@ def draw_frame_info(screen, trajectory, step_index, height, width, auto_play, au
         screen.blit(manual_text, (width - 80, height - 40))
 
 
-def render_frame(frame_index, trajectory, agent, screen, action_tracker, train_card_market, player_hands, score_board):
-    if (frame_index < 0) or (frame_index >= len(trajectory)):
+def render_frame(step_index, trajectory, agent, screen, action_tracker, train_card_market, player_hands, score_board, height, width, auto_play, auto_speed, board_image, board_loc, board_outline_out, board_outline_in):
+    if (step_index < 0) or (step_index >= len(trajectory)):
         return
-    
+
     # Get current trajectory step
-    traj = trajectory[frame_index]
+    traj = trajectory[step_index]
     obs = agent.unprepare_state_tensor(traj[STATE_TENSOR_INDEX])
 
     # Update and draw action tracker
@@ -65,7 +53,7 @@ def render_frame(frame_index, trajectory, agent, screen, action_tracker, train_c
     action_tracker.draw(screen)
 
     # Draw the claimed routes up to this point
-    for i in range(frame_index + 1):
+    for i in range(step_index + 1):
         past_traj = trajectory[i]
 
         if past_traj[PHASE_INDEX] == PHASE_CLAIM_ROUTE:
@@ -90,8 +78,13 @@ def render_frame(frame_index, trajectory, agent, screen, action_tracker, train_c
         draw_dashed_line(screen, player_colors[obs["current_player"]], cities[ticket[2]][0], cities[ticket[3]][0], width=1)
 
     # Update and draw score board
-    score_board.update(obs["current_player"], int(traj[REWARD_INDEX] * 10))
-    score_board.draw(screen)
+    score_board.update(obs["current_player"], step_index, int(traj[REWARD_INDEX] * 10))
+    score_board.draw(screen, step_index)
     
+    print(f"Current player: {obs["current_player"]}")
+    print(f"\tTurn reward: {traj[REWARD_INDEX] * 10}")
+    print(f"\tScore array: {score_board.player_scores[:, :step_index + 1]}")
+    print()
+
     # Draw frame info
-    draw_frame_info()
+    draw_frame_info(screen, trajectory, step_index, height, width, auto_play, auto_speed)

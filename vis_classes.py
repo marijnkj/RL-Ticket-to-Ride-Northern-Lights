@@ -2,13 +2,6 @@ import pygame
 import numpy as np
 from vis_constants import colors, font, player_colors
 import math
-import torch
-import matplotlib.pyplot as plt
-from collections import defaultdict, deque
-import time
-import json
-from pathlib import Path
-
 
 class TrainCardMarket:
     def __init__(self, screen_dim, board_height):
@@ -129,25 +122,31 @@ class ActionTracker:
 
 
 class ScoreBoard:
-    def __init__(self, n_players, loc):
+    def __init__(self, n_players, loc, traj_len):
         self.n_players = n_players
         self.loc = loc
-        self.player_scores = [0] * self.n_players
+        self.player_scores = np.zeros((self.n_players, traj_len))
         self.cover_width = 0
 
     
-    def update(self, current_player, turn_reward):
-        self.player_scores[current_player] += turn_reward
+    def update(self, current_player, step_index, turn_reward):
+        if self.player_scores[current_player, step_index] == 0:
+            # If not zero, score has already been updated for this step
+            self.player_scores[current_player, step_index] = self.player_scores[current_player, step_index - 1] + turn_reward
 
+        for other_player in range(self.n_players):
+            if other_player != current_player:
+                # Don't update current player
+                self.player_scores[other_player, step_index] = self.player_scores[other_player, step_index - 1]
 
-    def draw(self, screen):
+    def draw(self, screen, step_index):
         # First draw white surface to cover previous text
         white_surface = pygame.Surface((self.cover_width, font.get_height() * self.n_players))
         white_surface.fill("white")
         screen.blit(white_surface, self.loc)
 
         # Then draw text
-        player_texts = [font.render(f"Player {i} score: {score}", False, "black") for i, score in enumerate(self.player_scores)]
+        player_texts = [font.render(f"Player {i} score: {score[step_index]}", False, "black") for i, score in enumerate(self.player_scores)]
         [screen.blit(player_text, (self.loc[0], self.loc[1] + i * font.get_height())) for i, player_text in enumerate(player_texts)]
 
         self.cover_width = max([player_text.get_width() for player_text in player_texts])
