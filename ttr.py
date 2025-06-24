@@ -612,9 +612,6 @@ class TicketToRideNorthernLightsPPOAgent:
         x = self.policy_encoder(state_batch)
         values = self.value_net(state_batch)
 
-        # logits = torch.stack([self.policy_heads[str(phase)](x[i]) for i, phase in enumerate(phases_batch)])
-        # mask_tensor = torch.tensor(action_masks_batch, dtype=torch.bool)
-
         # Iterate over "rows" in batch
         batch_probs = []
         for i in range(batch_size):
@@ -761,11 +758,18 @@ class TicketToRideNorthernLightsPPOAgent:
         all_returns = []
         all_values = []
 
+        self.policy_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.policy_optimizer, n_iterations)
+        self.value_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.value_optimizer, n_iterations)
+
         for _ in tqdm(range(n_iterations)):
             trajectories, advantages, returns, values = self.get_trajectory_batch(n=n_sample, gamma=gamma)
             policy_losses_i, value_losses_i = self.optimize(trajectories, advantages, returns, K=K, batch_size=batch_size, epsilon=epsilon, entropy_coef=entropy_coef)
             policy_losses += policy_losses_i
             value_losses += value_losses_i
+
+            # Update learning rate schedulers after each iteration
+            self.policy_scheduler.step()
+            self.value_scheduler.step()
 
             all_returns = all_returns + [ret for retur in [retur.tolist() for retur in returns] for ret in retur]
             all_values = all_values + [val for value in [value.tolist() for value in values] for val in value]
@@ -827,10 +831,12 @@ class TicketToRideNorthernLightsPPOAgent:
 
                 self.policy_optimizer.zero_grad()
                 policy_loss.backward()
+                torch.nn.utils.clip_grad_norm_(list(self.policy_encoder.parameters()) + list(self.policy_heads.parameters()), max_norm=0.5)
                 self.policy_optimizer.step()
 
                 self.value_optimizer.zero_grad()
                 value_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), max_norm=0.5)
                 self.value_optimizer.step()
 
                 policy_losses.append(policy_loss.item())
@@ -866,10 +872,10 @@ class TicketToRideNorthernLightsPPOAgent:
 import pickle
 
 env = TicketToRideNorthernLightsEnv()
-agent = TicketToRideNorthernLightsPPOAgent(env, policy_lr=3e-4, value_lr=3e-4)
-agent.train(n_iterations=100, K=4, n_sample=64, gamma=0.99, batch_size=256, entropy_coef=0.1)
+agent = TicketToRideNorthernLightsPPOAgent(env, policy_lr=3e-3, value_lr=3e-4)
+agent.train(n_iterations=10, K=4, n_sample=20, gamma=0.99, batch_size=256, entropy_coef=0.1)
 
-with open("trained_agent.pkl", "wb") as f:
+with open("trained_agent_small.pkl", "wb") as f:
     pickle.dump(agent, f)
 
 # with open("trained_agent_small.pkl", "rb") as f:
