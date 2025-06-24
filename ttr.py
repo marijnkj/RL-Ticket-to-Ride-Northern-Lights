@@ -761,7 +761,7 @@ class TicketToRideNorthernLightsPPOAgent:
         self.policy_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.policy_optimizer, n_iterations)
         self.value_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.value_optimizer, n_iterations)
 
-        for _ in tqdm(range(n_iterations)):
+        for i in tqdm(range(n_iterations)):
             trajectories, advantages, returns, values = self.get_trajectory_batch(n=n_sample, gamma=gamma)
             policy_losses_i, value_losses_i = self.optimize(trajectories, advantages, returns, K=K, batch_size=batch_size, epsilon=epsilon, entropy_coef=entropy_coef)
             policy_losses += policy_losses_i
@@ -774,11 +774,13 @@ class TicketToRideNorthernLightsPPOAgent:
             all_returns = all_returns + [ret for retur in [retur.tolist() for retur in returns] for ret in retur]
             all_values = all_values + [val for value in [value.tolist() for value in values] for val in value]
 
-        _, axs = plt.subplots(ncols=2)
-        axs[0].plot(policy_losses)
-        axs[1].plot(value_losses)
-        axs[0].set(title="Policy Loss")
-        axs[1].set(title="Value Loss")
+            if i % 10 == 0:
+                fig, axs = plt.subplots(ncols=2)
+                axs[0].plot(policy_losses)
+                axs[1].plot(value_losses)
+                axs[0].set(title="Policy Loss")
+                axs[1].set(title="Value Loss")
+                fig.suptitle(f"Iteration {i}")
 
         print(f"Return stats:")
         print(f"  Mean: {np.mean(all_returns):.4f}")
@@ -873,7 +875,7 @@ import pickle
 
 env = TicketToRideNorthernLightsEnv()
 agent = TicketToRideNorthernLightsPPOAgent(env, policy_lr=3e-3, value_lr=3e-4)
-agent.train(n_iterations=10, K=4, n_sample=20, gamma=0.99, batch_size=256, entropy_coef=0.1)
+agent.train(n_iterations=100, K=4, n_sample=64, gamma=0.99, batch_size=256, entropy_coef=0.1)
 
 with open("trained_agent_small.pkl", "wb") as f:
     pickle.dump(agent, f)
